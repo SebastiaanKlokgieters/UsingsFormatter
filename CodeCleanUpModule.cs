@@ -11,16 +11,16 @@ using JetBrains.ReSharper.Psi.CSharp.Tree;
 using JetBrains.ReSharper.Psi.Files;
 using JetBrains.ReSharper.Psi.Tree;
 using JetBrains.Util;
+using System.IO;
+using JetBrains.ReSharper.Psi.ExtensionsAPI.Tree;
+using JetBrains.ReSharper.Psi.Modules;
+using JetBrains.ReSharper.Psi.Transactions;
 
 namespace ReSharperPlugin.UsingsFormatter;
 
 [CodeCleanupModule]
 public class CodeCleanUpModule : ICodeCleanupModule
 {
-    private static readonly CodeCleanupSingleOptionDescriptor OurDescriptor = new CodeCleanupOptionDescriptor<bool>(
-        "UsingsCleanUp", new CodeCleanupLanguage("UsingsCleanUp", 1),
-        CodeCleanupOptionDescriptor.ReformatGroup, displayName: "Anderenaam");
-
     private readonly List<IUsingSymbolDirective> _foundDirectives = [];
 
     private readonly List<IUsingSymbolDirective> _duplicateDirectives = [];
@@ -49,18 +49,23 @@ public class CodeCleanUpModule : ICodeCleanupModule
         IProgressIndicator progressIndicator,
         IUserDataHolder cache)
     {
-        rangeMarker = new RangeMarker(sourceFile.Document, new TextRange());
         var psiFiles = sourceFile.GetPsiFiles<CSharpLanguage>();
+        progressIndicator.Start(100);
+        var project = sourceFile.GetProject();
+        var exists = project != null && File.Exists($"{project.GetLocation()}\\GlobalUsings.cs");
 
-        foreach (var psiFile in psiFiles)
+        for (int i = 0; i < psiFiles.Count; i++)
         {
+            var psiFile = psiFiles[i];
+
             foreach (var node in psiFile.Children().Where(n => n is IUsingList))
             {
                 var directives = node.Descendants<IUsingSymbolDirective>().Collect();
 
                 foreach (var directive in directives)
                 {
-                    if (_foundDirectives.Exists(u => u.ImportedSymbolName.QualifiedName == directive.ImportedSymbolName.QualifiedName))
+                    if (_foundDirectives.Exists(u =>
+                            u.ImportedSymbolName.QualifiedName == directive.ImportedSymbolName.QualifiedName))
                     {
                         _duplicateDirectives.Add(directive);
                     }
@@ -71,7 +76,30 @@ public class CodeCleanUpModule : ICodeCleanupModule
                 }
             }
 
-            return;
+            progressIndicator.Advance(i * 100 / psiFiles.Count);
+            i++;
+        }
+
+        if (_duplicateDirectives.Any())
+        {
+            if (!exists)
+            {
+                File.Create($"{project.GetLocation()}\\GlobalUsings.cs");
+            }
+
+            _duplicateDirectives.ForEach(d =>
+            {
+                var file = d.GetSourceFile();
+
+                if (file != null)
+                {
+                    file.GetPsiServices().Transactions.Execute(("Delete Using Directives"),
+                        () => { ModificationUtil.DeleteChild(d); }
+                    );
+
+                    Console.WriteLine("Deleted using directive");
+                }
+            });
         }
     }
 
@@ -79,4 +107,9 @@ public class CodeCleanUpModule : ICodeCleanupModule
     public PsiLanguageType LanguageType { get; } = CSharpLanguage.Instance;
     public ICollection<CodeCleanupOptionDescriptor> Descriptors { get; } = [OurDescriptor];
     public bool IsAvailableOnSelection { get; } = true;
+
+    private static readonly CodeCleanupSingleOptionDescriptor OurDescriptor =
+        new CodeCleanupOptionDescriptor<bool>("SortForProject",
+            new CodeCleanupLanguage("SortForProject", 1),
+            CodeCleanupOptionDescriptor.ReformatGroup, displayName: "Sort directives for project");
 }
