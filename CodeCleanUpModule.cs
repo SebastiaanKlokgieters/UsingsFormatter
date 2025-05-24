@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Linq;
 using JetBrains.Application.Progress;
 using JetBrains.DocumentModel;
 using JetBrains.ProjectModel;
@@ -8,22 +7,24 @@ using JetBrains.ReSharper.Feature.Services.CodeCleanup;
 using JetBrains.ReSharper.Psi;
 using JetBrains.ReSharper.Psi.CSharp;
 using JetBrains.ReSharper.Psi.CSharp.Tree;
-using JetBrains.ReSharper.Psi.Files;
 using JetBrains.ReSharper.Psi.Tree;
 using JetBrains.Util;
 using System.IO;
+using System.Linq;
 using JetBrains.ReSharper.Psi.ExtensionsAPI.Tree;
 using JetBrains.ReSharper.Psi.Modules;
-using JetBrains.ReSharper.Psi.Transactions;
 
 namespace ReSharperPlugin.UsingsFormatter;
 
 [CodeCleanupModule]
 public class CodeCleanUpModule : ICodeCleanupModule
 {
-    private readonly List<IUsingSymbolDirective> _foundDirectives = [];
+    private readonly List<ITreeNode> _foundDirectives = [];
 
-    private readonly List<IUsingSymbolDirective> _duplicateDirectives = [];
+    private readonly List<ITreeNode> _duplicateDirectives = [];
+    
+    private int _count;
+    private int _totalCount;
 
     public void SetDefaultSetting(CodeCleanupProfile profile, CodeCleanupService.DefaultProfileType profileType)
     {
@@ -35,12 +36,12 @@ public class CodeCleanUpModule : ICodeCleanupModule
 
     public bool IsAvailable(IPsiSourceFile sourceFile)
     {
-        return sourceFile.LanguageType.Is<CSharpProjectFileType>();
+        return sourceFile.LanguageType.Is<CSharpProjectFileType>() && sourceFile.GetProject() != null;
     }
 
     public bool IsAvailable(CodeCleanupProfile profile)
     {
-        return true;
+        return profile.GetSetting(OurDescriptor).Equals(true);
     }
 
     public void Process(IPsiSourceFile sourceFile,
@@ -49,67 +50,94 @@ public class CodeCleanUpModule : ICodeCleanupModule
         IProgressIndicator progressIndicator,
         IUserDataHolder cache)
     {
-        var psiFiles = sourceFile.GetPsiFiles<CSharpLanguage>();
-        progressIndicator.Start(100);
         var project = sourceFile.GetProject();
         var exists = project != null && File.Exists($"{project.GetLocation()}\\GlobalUsings.cs");
 
-        for (int i = 0; i < psiFiles.Count; i++)
+        if (_count == 0)
         {
-            var psiFile = psiFiles[i];
-
-            foreach (var node in psiFile.Children().Where(n => n is IUsingList))
-            {
-                var directives = node.Descendants<IUsingSymbolDirective>().Collect();
-
-                foreach (var directive in directives)
-                {
-                    if (_foundDirectives.Exists(u =>
-                            u.ImportedSymbolName.QualifiedName == directive.ImportedSymbolName.QualifiedName))
-                    {
-                        _duplicateDirectives.Add(directive);
-                    }
-                    else
-                    {
-                        _foundDirectives.Add(directive);
-                    }
-                }
-            }
-
-            progressIndicator.Advance(i * 100 / psiFiles.Count);
-            i++;
+            SetNumOfCSharpFiles(project);
+            progressIndicator.CurrentItemText = "Searching for duplicate using directives";
+            progressIndicator.Start(_totalCount);
         }
 
-        if (_duplicateDirectives.Any())
+        if (sourceFile.LanguageType.Is<CSharpProjectFileType>() && sourceFile.IsProjFile())
         {
-            if (!exists)
+            var file = sourceFile.GetTheOnlyPsiFile<CSharpLanguage>();
+            if (file != null)
             {
-                File.Create($"{project.GetLocation()}\\GlobalUsings.cs");
+                var directives = file.Children<IUsingSymbolDirective>();
+                _foundDirectives.AddRange(directives);
             }
 
-            _duplicateDirectives.ForEach(d =>
+            progressIndicator.Advance();
+            _count++;
+        }
+
+        if (_count == _totalCount)
+        {
+            progressIndicator.CurrentItemText = "Deleting duplicate using directives";
+            progressIndicator.Advance();
+
+            for (int i = 0; i < _foundDirectives.Count; i++)
             {
-                var file = d.GetSourceFile();
+                var directive = _foundDirectives[i];
+                var duplicates = _foundDirectives.FindAll(f => f.GetText() == directive.GetText());
 
-                if (file != null)
+                if (duplicates.Count > 1)
                 {
-                    file.GetPsiServices().Transactions.Execute(("Delete Using Directives"),
-                        () => { ModificationUtil.DeleteChild(d); }
-                    );
-
-                    Console.WriteLine("Deleted using directive");
+                    _foundDirectives.RemoveRange(duplicates);
+                    _duplicateDirectives.AddRange(duplicates);
                 }
-            });
+            }
+
+            if (_duplicateDirectives.Any())
+            {
+                if (!exists)
+                {
+                    File.Create($"{project.GetLocation()}\\GlobalUsings.cs");
+                }
+
+                _duplicateDirectives.ForEach(d =>
+                {
+                    var file = d.GetSourceFile();
+
+                    if (file != null)
+                    {
+                        file.GetPsiServices().Transactions.Execute(("Delete Using Directives"),
+                            () => { ModificationUtil.DeleteChild(d); });
+                        //ToDO Figure out a way to add it to the globalusings and to be able to revert the change
+                        Console.WriteLine("Deleted using directive");
+                    }
+                });
+            }
         }
     }
 
+    private void SetNumOfCSharpFiles(IProject project)
+    {
+        var subItems = project.GetSubItems();
+
+        foreach (var subItem in subItems)
+        {
+            if (subItem is IProjectFile projectFile)
+            {
+                if (Equals(projectFile.LanguageType, CSharpProjectFileType.Instance))
+                {
+                    _totalCount++;
+                }
+            }
+        }
+    }
+
+
     public string Name { get; } = "UsingsCleanUp";
-    public PsiLanguageType LanguageType { get; } = CSharpLanguage.Instance;
+    public PsiLanguageType LanguageType { get; } = CSharpLanguage.Instance!;
     public ICollection<CodeCleanupOptionDescriptor> Descriptors { get; } = [OurDescriptor];
     public bool IsAvailableOnSelection { get; } = true;
 
     private static readonly CodeCleanupSingleOptionDescriptor OurDescriptor =
         new CodeCleanupOptionDescriptor<bool>("SortForProject",
-            new CodeCleanupLanguage("SortForProject", 1),
-            CodeCleanupOptionDescriptor.ReformatGroup, displayName: "Sort directives for project");
+            new CodeCleanupLanguage("C#", 5),
+            CodeCleanupOptionDescriptor.OptimizeImportsGroup,
+            displayName: "Move Duplicate Using Directives to GlobalUsings.cs");
 }
